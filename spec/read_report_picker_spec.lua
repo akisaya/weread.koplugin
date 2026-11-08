@@ -44,6 +44,7 @@ local host = setmetatable({
             if key == "read_report" then config = value end
         end,
         flush = function() end,
+        is_cookie_expired = function() return false end,
     },
     requireLogin = function() return true end,
     refreshBookshelf = function(_self, _view, options) picker_options = options end,
@@ -153,5 +154,20 @@ host:onShowWeReadReportStatus()
 expect(status_text == "Report book: Auto: Auto Book\nStatus: Running\nReported: 3 times, last: "
         .. os.date("%H:%M:%S", report_status.last_time) .. "\nLast error: offline",
     "status gesture preserves the live automatic target, report time, and last error")
+
+-- After a restart the in-memory stop state is gone; the persisted marker must
+-- still explain why reporting is stopped.
+config.mode = "auto"
+report_status = { running = false, count = 0 }
+host.settings.is_cookie_expired = function() return true end
+host:onShowWeReadReportStatus()
+expect(status_text:find("Cookie expired", 1, true) ~= nil,
+    "status page shows the persisted cookie expiry after restart")
+
+host.settings.is_cookie_expired = function() return false end
+report_status = { running = false, count = 0, stop_reason = "report_stalled" }
+host:onShowWeReadReportStatus()
+expect(status_text:find("Reporting paused after repeated failures.", 1, true) ~= nil,
+    "status page shows the stalled reason")
 
 print(("read_report_picker_spec: %d checks"):format(checks))

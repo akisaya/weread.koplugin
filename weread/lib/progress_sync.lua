@@ -372,6 +372,18 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
             return
         end
         self.uploading = false
+        if ok and not accepted and type(outcome) == "table"
+            and outcome.cookie_expired == true then
+            self.state = "error"
+            self:_persist(book_id, {
+                last_sync_error = "authentication_required",
+            })
+            log("warn", "upload skipped: cookie expired")
+            if show_result then
+                self.notify("authentication_required", {})
+            end
+            return
+        end
         if ok and accepted then
             self.state = "verified"
             self.dirty = false

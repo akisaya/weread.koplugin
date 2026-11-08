@@ -159,6 +159,23 @@ expect(values.account.name == "new-user" and settings:is_api_configured(),
 expect(settings:is_cookie_configured(),
     "modern wr_gid login cookie was not recognized")
 
+expect(not settings:is_cookie_expired(),
+    "fresh settings must not report an expired cookie")
+expect(settings:mark_cookie_expired(),
+    "cookie expiry marker was not stored")
+expect(settings:is_cookie_expired() and values.cookie_expired == true,
+    "cookie expiry marker was not persisted")
+local flush_after_expiry = flush_count
+expect(not settings:mark_cookie_expired(),
+    "repeated expiry should be a no-op")
+expect(flush_count == flush_after_expiry,
+    "repeated expiry should not flush the settings store")
+expect(settings:mark_cookie_valid(), "cookie expiry marker was not cleared")
+expect(not settings:is_cookie_expired() and values.cookie_expired == false,
+    "cookie expiry marker was not reset")
+expect(not settings:mark_cookie_valid(),
+    "clearing a valid cookie state should be a no-op")
+
 expect(settings:set_download_dir("/external/books") == "/external/books",
     "custom download directory was not selected")
 expect(values.download_dir == "/external/books",
@@ -193,10 +210,13 @@ expect(values.device_fingerprint == fingerprint and flush_count == before_finger
 expect(Settings:new():get_device_fingerprint() == fingerprint and random_reads == 1,
     "reopening settings should reuse the existing fingerprint")
 
+settings:mark_cookie_expired()
 settings:reset_account()
 expect(values.api_key == "" and next(values.cookies) == nil
     and values.account.name == "",
     "account reset left credentials behind")
+expect(not settings:is_cookie_expired(),
+    "account reset left the cookie expiry marker behind")
 expect(settings:get_device_fingerprint() == fingerprint and random_reads == 1,
     "logout must not rotate the device fingerprint")
 

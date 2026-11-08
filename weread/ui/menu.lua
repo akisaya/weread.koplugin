@@ -100,6 +100,9 @@ function M:getMainMenuItems()
                 if account.login_method == "qr" and tonumber(account.login_time or 0) > 0 then
                     local name = type(account.name) == "string" and account.name or ""
                     if name == "" then name = _("Unknown account") end
+                    if self.settings:is_cookie_expired() then
+                        return T(_("Logged in · %1 (expired)"), name)
+                    end
                     return T(_("Logged in · %1"), name)
                 end
                 return _("QR code login")
@@ -109,7 +112,10 @@ function M:getMainMenuItems()
             callback = self:safeCallback(_("QR login"), function(touchmenu_instance)
                 self._login_menu_instance = touchmenu_instance
                 local account = self.settings:get("account", {})
-                if account.login_method == "qr" and tonumber(account.login_time or 0) > 0 then
+                -- An expired credential needs new credentials, not another
+                -- status dialog: let this item re-open the QR login directly.
+                if account.login_method == "qr" and tonumber(account.login_time or 0) > 0
+                    and not self.settings:is_cookie_expired() then
                     self:showAccountStatus()
                 else
                     self.qr_login:start()

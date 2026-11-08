@@ -78,6 +78,7 @@ local function run_login(fingerprint)
     protocol_client.request_follow = protocol_client.request
     local settings = {
         get_device_fingerprint = function() return fingerprint end,
+        mark_cookie_valid = function() end,
         update_auth = function(_self, credentials, options)
             expect(options.replace_cookies, "login should replace account cookies")
             saved = credentials

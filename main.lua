@@ -116,6 +116,12 @@ function WeReadPlugin:init()
         is_online = function()
             return self:isNetworkConnected()
         end,
+        -- Surfaced once when the background loop stops on a rejected renewal.
+        notify_cookie_expired = function()
+            self:showInfo(_(
+                "WeRead cookie has expired. Background reading-time reporting has stopped. Please scan the QR code to log in again."
+            ))
+        end,
     }
     self.progress_sync = ProgressSync:new{
         settings = self.settings,

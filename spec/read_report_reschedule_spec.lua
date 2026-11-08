@@ -30,6 +30,9 @@ local function make_report(opts)
                 return { enabled = true, interval_seconds = opts.interval or 30 }
             end
         end,
+        is_cookie_expired = function() return false end,
+        mark_cookie_expired = function() end,
+        mark_cookie_valid = function() end,
     }
     report.scheduled = {}
     report.unscheduled = {}

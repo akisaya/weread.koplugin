@@ -15,6 +15,9 @@ local defaults = {
     cookies = {},
     wr_ticket = "",
     wr_wrpa = "",
+    -- A cookie renewal was definitively rejected: only new credentials may
+    -- clear this. Persisted so a plugin restart cannot resume futile retries.
+    cookie_expired = false,
     account = {
         name = "",
         user_vid = "",
@@ -121,6 +124,7 @@ local function clear_auth_store(store)
     store:saveSetting("cookies", {})
     store:saveSetting("wr_ticket", "")
     store:saveSetting("wr_wrpa", "")
+    store:saveSetting("cookie_expired", false)
     store:saveSetting("account", deepcopy(defaults.account))
 end
 
@@ -150,6 +154,7 @@ function Settings:new()
         obj.store:saveSetting("account", { name = "Mock", user_vid = "900000", login_method = "mock" })
         obj.store:saveSetting("wr_ticket", "")
         obj.store:saveSetting("wr_wrpa", "")
+        obj.store:saveSetting("cookie_expired", false)
         -- A test must not move downloaded files into a production cache.
         obj.store:saveSetting("download_dir", "")
         obj.store:flush()
@@ -391,6 +396,32 @@ end
 
 function Settings:is_cookie_configured()
     return Cookie.has_login_cookie(self:get("cookies", {})) == true
+end
+
+-- True only after a renewal was definitively rejected. Cookies are kept so an
+-- explicit renewal or QR login can replace them; repeated failures do not
+-- rewrite the store.
+function Settings:is_cookie_expired()
+    return self:get("cookie_expired", false) == true
+end
+
+function Settings:mark_cookie_expired()
+    if self:is_cookie_expired() then
+        return false
+    end
+    self:set("cookie_expired", true)
+    self:flush()
+    return true
+end
+
+-- New credentials (or an accepted report) proved the cookie works again.
+function Settings:mark_cookie_valid()
+    if not self:is_cookie_expired() then
+        return false
+    end
+    self:set("cookie_expired", false)
+    self:flush()
+    return true
 end
 
 function Settings:is_api_configured()

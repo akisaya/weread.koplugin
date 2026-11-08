@@ -212,6 +212,11 @@ function M:renewCookieWithUI()
     self:runNetworkAction(_("Renew cookie"), function()
         self.client:renew_cookie()
         logger.info("cookie renewed")
+        -- A successful manual renewal clears the expiry marker; re-arm the
+        -- background loop that was stopped on a rejected renewal.
+        if self.read_report then
+            self.read_report:on_credentials_replaced()
+        end
         return _("WeRead cookie renewed.")
     end)
 end
@@ -224,16 +229,28 @@ function M:showAccountStatus()
             and _("Unknown account") or _("Not logged in")
     end
     local login_method = account.login_method == "qr" and _("QR login") or _("Unknown")
-    local cookie_status = self.settings:is_cookie_configured() and _("configured") or _("missing")
+    local cookie_status
+    if not self.settings:is_cookie_configured() then
+        cookie_status = _("missing")
+    elseif self.settings:is_cookie_expired() then
+        cookie_status = _("Cookie expired")
+    else
+        cookie_status = _("configured")
+    end
     local api_status = self.settings:is_api_configured() and _("configured") or _("missing")
-    self:showInfo(T(
+    local msg = T(
         _("Account: %1\nLogin method: %2\nCookie: %3\nOfficial API key: %4\nCache directory:\n%5"),
         account_name,
         login_method,
         cookie_status,
         api_status,
         BD.dirpath(self.settings.cache_dir)
-    ))
+    )
+    if self.settings:is_cookie_expired() then
+        msg = msg .. "\n"
+            .. _("Please scan the QR code again to restore background reporting.")
+    end
+    self:showInfo(msg)
 end
 
 function M:confirmClearAccount()

@@ -150,6 +150,14 @@ function M:onShowWeReadReportStatus()
     local last = report_status.last_time
         and os.date("%H:%M:%S", report_status.last_time) or "--"
     local err = report_status.last_error or ""
+    if self.settings:is_cookie_expired() or err == "cookie expired"
+        or report_status.stop_reason == "cookie_expired" then
+        -- Read the persisted marker as well: the in-memory stop state is lost
+        -- on restart, so the status page must still explain why it is stopped.
+        err = _("Cookie expired")
+    elseif report_status.stop_reason == "report_stalled" then
+        err = _("Reporting paused after repeated failures.")
+    end
     local msg = T(_("Report book: %1\nStatus: %2"), target, status)
         .. "\n" .. T(_("Reported: %1 times, last: %2"), tostring(count), last)
     if err ~= "" then

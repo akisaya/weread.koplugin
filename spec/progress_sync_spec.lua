@@ -278,6 +278,36 @@ test("page change uploads once on close", function()
         "successful upload clears pending snapshot")
 end)
 
+test("cookie expiry maps manual upload to authentication_required", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 50,
+        chapterUid = 33,
+        chapterIdx = 3,
+        chapterOffset = 100,
+        updateTime = 10,
+    })
+    f.sync.upload_position = function()
+        return false, {
+            accepted = false,
+            cookie_expired = true,
+            error = "cookie expired",
+            error_kind = "authentication",
+        }
+    end
+    f.sync:on_reader_ready()
+    f.drain()
+    f.choices[1].keep_local()
+    f.drain()
+    local last = f.notifications[#f.notifications]
+    eq(last and last.code, "authentication_required",
+        "manual upload asks the user to log in again")
+    eq(f.values.books.book.last_sync_error, "authentication_required",
+        "upload failure records authentication_required")
+    eq(f.values.books.book.pending_upload_position ~= nil, true,
+        "pending snapshot is kept for retry after login")
+end)
+
 test("remote choice jumps and verifies before reporting", function()
     local f = fixture({
         bookId = "book",

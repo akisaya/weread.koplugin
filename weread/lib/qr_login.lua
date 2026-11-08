@@ -298,8 +298,13 @@ function QRLogin:_complete_protocol(login_result, generation)
         wr_wrpa = "",
         account = account,
     }, { replace_cookies = true })
+    self.settings:mark_cookie_valid()
     if self.host.onWeReadAccountChanged then
         self.host:onWeReadAccountChanged()
+    end
+    -- Optional dependency: resume a loop stopped on a rejected renewal.
+    if self.host.read_report then
+        self.host.read_report:on_credentials_replaced()
     end
     self.login_cookies = nil
     return account

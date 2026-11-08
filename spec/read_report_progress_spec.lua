@@ -70,6 +70,7 @@ end
 
 local function fixture(provider)
     local records = {}
+    local cookie = { expired = false, valid_events = 0 }
     local settings = {
         get = function(_self, key)
             if key == "read_report" then
@@ -85,8 +86,22 @@ local function fixture(provider)
             return {}
         end,
         is_cookie_configured = function() return true end,
+        is_cookie_expired = function() return cookie.expired end,
+        mark_cookie_expired = function()
+            cookie.expired = true
+        end,
+        mark_cookie_valid = function()
+            cookie.expired = false
+            cookie.valid_events = cookie.valid_events + 1
+        end,
     }
     local client = {
+        auth_error_code = function(result)
+            return type(result) == "table" and result.errCode or nil
+        end,
+        is_auth_expired_code = function(code)
+            return code == -2012 or code == -2010
+        end,
         report_read = function(_self, payload)
             records[#records + 1] = payload
             return { succ = 1 }
@@ -106,7 +121,7 @@ local function fixture(provider)
         subprocess = false,
         now = function() return 100 end,
     }
-    return report, records
+    return report, records, cookie
 end
 
 test("unverified position blocks reading-time reporting", function()
@@ -199,6 +214,176 @@ test("report context backfills SQLite from catalog.json", function()
     }
     report:_build_context("book", false, book)
     eq(written_catalog, disk_catalog, "catalog.json backfills SQLite")
+end)
+
+test("expired cookie stops reporting instead of looping", function()
+    local report, _, cookie = fixture(function()
+        return { chapter_uid = 1, chapter_offset = 0, percent = 1 }, nil, true
+    end)
+    cookie.expired = true
+    report.last_renew_attempt = 100
+    local proceed = report:_precheck()
+    eq(proceed, false, "expired cookie blocks tick")
+    local status = report:status()
+    eq(status.state, "stopped", "expired cookie stops the loop")
+    eq(status.stop_reason, "cookie_expired", "cookie expiry stop reason")
+    eq(status.last_error_kind, "authentication", "authentication error kind")
+    eq(status.last_error, "cookie expired", "authentication error surfaced")
+end)
+
+test("failed report keeps the cookie expired", function()
+    local report, _, cookie = fixture()
+    report:_apply_outcome{
+        accepted = false,
+        cookie_expired = true,
+        error = "Cookie renewal rejected; error_code=-2012",
+        error_kind = "authentication",
+    }
+    eq(cookie.expired, true, "cookie stays expired after failed final request")
+    eq(cookie.valid_events, 0, "failed report must not write a valid state")
+end)
+
+test("auth rejection marks cookie expired and success clears it", function()
+    local report, _, cookie = fixture()
+    report:_apply_outcome{
+        accepted = false,
+        error = "Cookie renewal rejected; error_code=-2012",
+        error_kind = "authentication",
+        cookie_expired = true,
+    }
+    eq(cookie.expired, true, "cookie marked expired")
+    eq(report:status().failure_count, 1, "failure recorded")
+    report:_apply_outcome{ accepted = true }
+    eq(cookie.expired, false, "cookie marked valid after success")
+    eq(report:status().count, 1, "success recorded")
+end)
+
+local function context_book()
+    return {
+        book_id = "book",
+        psvts = "ps",
+        chapter_uid = 11,
+        chapter_idx = 1,
+        chapter_offset = 0,
+        progress = 1,
+        chapters = { { chapterUid = 11, chapterIdx = 1 } },
+    }
+end
+
+test("successful report clears the expired state", function()
+    local report, _, cookie = fixture()
+    cookie.expired = true
+    report.ensure_context = context_book
+    report._send = function() return { succ = 1 } end
+    local ok = report:_apply_outcome(
+        report:_run_pipeline("book", { allow_renewal = true }))
+    eq(ok, true, "report accepted")
+    eq(cookie.expired, false, "expired state cleared")
+    eq(cookie.valid_events, 1, "cookie marked valid once")
+end)
+
+test("HTTP 401 is transport, not a cookie verdict", function()
+    local report, _, cookie = fixture()
+    report.ensure_context = context_book
+    local renew_calls, sends = 0, 0
+    report.client.renew_cookie = function()
+        renew_calls = renew_calls + 1
+        return { succ = 1 }
+    end
+    report._send = function()
+        sends = sends + 1
+        error("weread/lib/client.lua:528: HTTP 401, content_type=text/html")
+    end
+    local outcome = report:_run_pipeline("book", { allow_renewal = true })
+    eq(sends, 1, "HTTP 401 is not retried")
+    eq(renew_calls, 0, "HTTP 401 does not trigger renewal")
+    eq(outcome.error_kind, "transport", "HTTP 401 remains transport")
+    eq(cookie.expired, false, "HTTP 401 alone must not expire the cookie")
+end)
+
+test("auth payload without renewal is classified but not terminal", function()
+    local report, _, cookie = fixture()
+    report.ensure_context = context_book
+    report._send = function()
+        return { errCode = -2012 }, 200
+    end
+    local outcome = report:_run_pipeline("book", { allow_renewal = false })
+    eq(outcome.error_kind, "authentication", "auth payload classified")
+    eq(outcome.cookie_expired, false, "no marker without a definitive renewal")
+    eq(cookie.expired, false, "cookie state unchanged")
+end)
+
+test("transport failures stay transport failures", function()
+    local report = fixture()
+    report.ensure_context = context_book
+    report._send = function()
+        error("culled: connection reset")
+    end
+    local outcome = report:_run_pipeline("book", { allow_renewal = true })
+    eq(outcome.error_kind, "transport", "connection errors are not auth errors")
+    eq(outcome.renew_attempted, false, "transport errors do not renew")
+end)
+
+test("sustained failures stop reporting without marking the cookie expired", function()
+    local report, _, cookie = fixture()
+    local clock = 1000
+    report.now = function() return clock end
+    report.task = function() end
+    report:_apply_outcome{ accepted = false, error = "HTTP 500", error_kind = "transport" }
+    eq(report.failure_streak_started_at, 1000, "failure streak started")
+    clock = 1000 + 30 * 60 - 1
+    report:_apply_outcome{ accepted = false, error = "HTTP 500", error_kind = "transport" }
+    eq(report.task ~= nil, true, "loop still armed before the limit")
+    clock = 1000 + 30 * 60
+    report:_apply_outcome{ accepted = false, error = "HTTP 500", error_kind = "transport" }
+    eq(report.task, nil, "loop stopped after the limit")
+    eq(report.stop_reason, "report_stalled", "stalled stop reason")
+    eq(cookie.expired, false, "stalled reporting must not mark the cookie expired")
+end)
+
+test("a success resets the failure streak", function()
+    local report = fixture()
+    local clock = 1000
+    report.now = function() return clock end
+    report.task = function() end
+    report:_apply_outcome{ accepted = false, error = "HTTP 500", error_kind = "transport" }
+    clock = 1000 + 29 * 60
+    report:_apply_outcome{ accepted = true }
+    eq(report.failure_streak_started_at, nil, "success cleared the streak start")
+    clock = clock + 29 * 60
+    report:_apply_outcome{ accepted = false, error = "HTTP 500", error_kind = "transport" }
+    eq(report.task ~= nil, true, "a new streak uses a fresh window")
+end)
+
+test("offline ticks do not count toward the failure streak", function()
+    local report = fixture()
+    report.is_online = function() return false end
+    report.failure_streak_started_at = 1000
+    report:_precheck()
+    eq(report.state, "offline", "offline state")
+    eq(report.failure_streak_started_at, nil, "offline reset the streak start")
+end)
+
+test("watchdog stops a ticking loop when precheck keeps failing", function()
+    local report = fixture()
+    report.settings.is_cookie_configured = function() return false end
+    report.now = function() return 3000 end
+    report.failure_streak_started_at = 1000
+    report.task = function() end
+    local task = report.task
+    report:_tick(1, task)
+    eq(report.task, nil, "watchdog stopped the ticking loop")
+    eq(report.stop_reason, "report_stalled", "stalled reason from precheck")
+end)
+
+test("starting a new session resets the failure streak", function()
+    local report = fixture()
+    report.failure_streak_started_at = 1
+    report.consecutive_failures = 5
+    eq(report:start("test"), true, "session started")
+    eq(report.failure_streak_started_at, nil, "start cleared the streak start")
+    eq(report.consecutive_failures, 0, "start cleared the streak count")
+    report:stop("test_done")
 end)
 
 print(string.format(

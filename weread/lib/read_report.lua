@@ -12,6 +12,10 @@ local DEFAULT_INTERVAL_SECONDS = 30
 local MIN_INTERVAL_SECONDS = 10
 local CONTEXT_TTL_SECONDS = 15 * 60
 local RENEWAL_COOLDOWN_SECONDS = 10 * 60
+-- A sustained failure streak is paused instead of retried forever. This is a
+-- safety net, not a credential verdict: it does not set the cookie-expired
+-- marker, and a new reader session gets a fresh window.
+local FAILURE_STREAK_LIMIT_SECONDS = 30 * 60
 local JOB_POLL_INITIAL_SECONDS = 0.25
 local JOB_POLL_MAX_SECONDS = 2
 local JOB_TIMEOUT_SECONDS = 180
@@ -120,6 +124,15 @@ local function response_accepted(result, http_code)
     return false, body
 end
 
+-- HTTP 200 responses may still carry an auth error code in their body. Only the
+-- documented WeRead codes count; HTTP status codes are not reliable here.
+local function is_auth_failure(client, result)
+    if type(result) ~= "table" then
+        return false
+    end
+    return client.is_auth_expired_code(client.auth_error_code(result)) == true
+end
+
 local function full_response_body(client, result)
     if type(result) == "table" and client and type(client.json_encode) == "function" then
         local ok, encoded = pcall(function()
@@ -183,17 +196,43 @@ function ReadReport:new(options)
         now = options.now or os.time,
         session_id = tostring({}) .. ":" .. tostring((options.now or os.time)()),
         subprocess = options.subprocess or make_subprocess_runner(),
+        notify_cookie_expired = options.notify_cookie_expired,
         state = "stopped",
         generation = 0,
         count = 0,
         failure_count = 0,
         consecutive_failures = 0,
+        failure_streak_started_at = nil,
+        cookie_expiry_notified = false,
     }
     return setmetatable(object, self)
 end
 
 function ReadReport:_config()
     return self.settings:get("read_report")
+end
+
+function ReadReport:_cookie_expired()
+    return self.settings:is_cookie_expired() == true
+end
+
+function ReadReport:_mark_cookie_expired()
+    self.settings:mark_cookie_expired()
+end
+
+function ReadReport:_mark_cookie_valid()
+    self.settings:mark_cookie_valid()
+end
+
+function ReadReport:_notify_cookie_expired_once()
+    if self.cookie_expiry_notified then
+        return false
+    end
+    self.cookie_expiry_notified = true
+    if type(self.notify_cookie_expired) == "function" then
+        pcall(self.notify_cookie_expired)
+    end
+    return true
 end
 
 function ReadReport:_interval()
@@ -255,6 +294,9 @@ function ReadReport:_set_error(err, kind, prefix)
     self.last_error = message
     self.last_error_kind = kind or "error"
     self.failure_count = (self.failure_count or 0) + 1
+    if not self.failure_streak_started_at then
+        self.failure_streak_started_at = self.now()
+    end
     self.consecutive_failures = (self.consecutive_failures or 0) + 1
     self.state = "error"
     if self.logged_error ~= message then
@@ -272,6 +314,7 @@ function ReadReport:_record_success(result)
     self.logged_error = nil
     self.last_skip = nil
     self.consecutive_failures = 0
+    self.failure_streak_started_at = nil
     self.state = "active"
     if recovered or self.count == 1 or self.count % 20 == 0 then
         log("info", "read report success:",
@@ -307,15 +350,47 @@ function ReadReport:maybe_start(reason)
     self.current_book_id = book_id
     self.current_book_title = title
     self.current_book_source = source
+    -- A restart loses the in-memory notification flag but the persisted
+    -- marker remains: surface it once instead of silently never reporting.
+    if self:_cookie_expired() then
+        self:_stop_on_cookie_expired()
+    end
     if self.task then
         return true, title, source
     end
     return self:start(reason), title, source
 end
 
+-- The persisted marker gates every loop start: reader_ready, resume,
+-- document-change and a plugin restart cannot re-arm a stopped loop.
+function ReadReport:_credentials_gate_open()
+    if not self:_cookie_expired() then
+        return true
+    end
+    self:_log_skip("cookie_expired")
+    return false
+end
+
+-- Called after a QR login (or a successful manual renewal) proved new
+-- credentials usable. Clear the marker and re-arm the loop.
+function ReadReport:on_credentials_replaced()
+    self.cookie_expiry_notified = false
+    self:_mark_cookie_valid()
+    self.last_renew_attempt = nil
+    self.last_error = nil
+    self.last_error_kind = nil
+    self.logged_error = nil
+    self.consecutive_failures = 0
+    self.failure_streak_started_at = nil
+    return self:maybe_start("credentials_replaced")
+end
+
 function ReadReport:start(reason)
     if self.task then
         return true
+    end
+    if not self:_credentials_gate_open() then
+        return false
     end
     local book_id, title, source = self:resolve_target()
     if not self:_config().enabled or self.suspended or not book_id then
@@ -330,6 +405,8 @@ function ReadReport:start(reason)
     self.state = "waiting"
     self.stop_reason = nil
     self.last_skip = nil
+    self.consecutive_failures = 0
+    self.failure_streak_started_at = nil
 
     local task
     task = function()
@@ -428,6 +505,12 @@ function ReadReport:_tick(generation, task)
     local ok, err = pcall(function()
         local proceed, book_id, position = self:_precheck()
         if not proceed then
+            -- Precheck may have stopped or replaced the loop (cookie expiry,
+            -- no document, document change); only the still-current task is a
+            -- candidate for the generic watchdog.
+            if self.task == task and self:_failure_streak_expired() then
+                self:_stop_on_failure_streak()
+            end
             self:_schedule_next(generation, task)
             return
         end
@@ -457,6 +540,9 @@ function ReadReport:_tick(generation, task)
     end)
     if not ok then
         self:_set_error(err, "task", "read report task failed:")
+        if self.task == task and self:_failure_streak_expired() then
+            self:_stop_on_failure_streak()
+        end
         self:_schedule_next(generation, task)
     end
 end
@@ -494,7 +580,16 @@ function ReadReport:_precheck()
     end
     if not self.is_online() then
         self.state = "offline"
+        -- Offline time is not a reporting failure; a reconnect gets a fresh
+        -- watchdog window instead of immediately tripping the old one.
+        self.failure_streak_started_at = nil
         self:_log_skip("offline")
+        return false
+    end
+    if self:_cookie_expired() then
+        -- Renewal was already rejected: no network work at all until new
+        -- credentials arrive through QR login or an explicit renewal.
+        self:_stop_on_cookie_expired()
         return false
     end
     local position
@@ -512,6 +607,18 @@ end
 
 function ReadReport:_renewal_allowed()
     return self.now() - (self.last_renew_attempt or 0) >= RENEWAL_COOLDOWN_SECONDS
+end
+
+-- Entry points outside the scheduled tick (manual report, progress-sync
+-- upload) honor the same gate, including ProgressSync's automatic calls on
+-- document close / suspend.
+local function cookie_gate_outcome()
+    return {
+        accepted = false,
+        cookie_expired = true,
+        error = "cookie expired",
+        error_kind = "authentication",
+    }
 end
 
 function ReadReport:_auth_fingerprint()
@@ -607,6 +714,9 @@ function ReadReport:_poll_job(job, generation, task)
         log("warn", "read report job timed out, terminating:", "pid=", job.pid)
         self:_abandon_job(job)
         self:_set_error("report job timed out", "transport", "read report job failed:")
+        if self:_failure_streak_expired() then
+            self:_stop_on_failure_streak()
+        end
         self:_schedule_next(generation, task)
         return
     end
@@ -678,9 +788,17 @@ end
 
 function ReadReport:_apply_job_outcome(job, outcome)
     local book_id = job.book_id
+    -- A changed auth fingerprint means the user logged in again while the job
+    -- ran. The child's cookie state is stale too: neither credentials nor the
+    -- expiry marker (nor a terminal stop) may be applied to the new session.
+    local stale = job.auth_fingerprint ~= nil
+        and self:_auth_fingerprint() ~= job.auth_fingerprint
     if type(outcome) == "table" then
+        if stale then
+            outcome.stale = true
+        end
         if type(outcome.auth) == "table" then
-            if self:_auth_fingerprint() ~= job.auth_fingerprint then
+            if stale then
                 log("info", "skip renewed auth write-back: parent auth changed during job")
             else
                 local ok, err = pcall(function()
@@ -711,14 +829,28 @@ function ReadReport:_apply_job_outcome(job, outcome)
     return self:_apply_outcome(outcome)
 end
 
+-- A successful report proves the credential works. Failures leave the marker
+-- alone: a terminal rejection is persisted by _stop_on_cookie_expired().
+function ReadReport:_apply_cookie_state(outcome)
+    if outcome.accepted then
+        self:_mark_cookie_valid()
+        self.cookie_expiry_notified = false
+    end
+end
+
 function ReadReport:_apply_outcome(outcome)
     if type(outcome) ~= "table" then
         self:_set_error("report job returned no result", "job", "read report job failed:")
         return false
     end
+    if outcome.stale then
+        log("info", "discard stale report outcome: parent auth changed during job")
+        return false
+    end
     if outcome.renew_attempted then
         self.last_renew_attempt = self.now()
     end
+    self:_apply_cookie_state(outcome)
     if outcome.accepted then
         self:_record_success({ synckey = outcome.has_synckey and true or nil })
         return true
@@ -726,7 +858,54 @@ function ReadReport:_apply_outcome(outcome)
     self:_set_error(outcome.error or "unknown report failure",
         outcome.error_kind or "error",
         outcome.error_prefix)
+    if outcome.cookie_expired then
+        self:_stop_on_cookie_expired()
+    elseif self:_failure_streak_expired() then
+        self:_stop_on_failure_streak()
+    end
     return false
+end
+
+-- A definitive renewal rejection is terminal: the server only renews a
+-- session it still considers valid, so waiting for another cooldown cannot
+-- recover it. Persist the marker (the start() gate reads it), stop the loop
+-- and surface the state in the UI exactly once.
+function ReadReport:_stop_on_cookie_expired()
+    -- Persist the marker even when the notification was already shown: a
+    -- failed flush on the first attempt must not leave the gate open after a
+    -- restart.
+    self:_mark_cookie_expired()
+    if not self.cookie_expiry_notified then
+        -- The report status page localizes this machine string.
+        self.last_error = "cookie expired"
+        self.last_error_kind = "authentication"
+        log("warn", "reading time report stopped: cookie expired")
+        self:_notify_cookie_expired_once()
+    end
+    -- Always ensure the loop is stopped: maybe_start may have marked the state
+    -- while a task was still scheduled.
+    self:stop("cookie_expired")
+end
+
+-- A sustained failure streak is paused instead of retried forever. This is a
+-- safety net for unclassified failures (renewal 5xx, context errors, unknown
+-- codes), not a credential verdict: it never sets cookie_expired.
+function ReadReport:_failure_streak_expired()
+    return self.failure_streak_started_at ~= nil
+        and self.now() - self.failure_streak_started_at >= FAILURE_STREAK_LIMIT_SECONDS
+end
+
+function ReadReport:_stop_on_failure_streak()
+    -- A persisted credential verdict always outranks the generic watchdog.
+    if self:_cookie_expired() then
+        self:_stop_on_cookie_expired()
+        return
+    end
+    if self.stop_reason == "report_stalled" then
+        return
+    end
+    self:stop("report_stalled")
+    log("warn", "reading time report paused after a sustained failure streak")
 end
 
 function ReadReport:_context_snapshot(book)
@@ -794,6 +973,14 @@ function ReadReport:_child_report(book_id, allow_renewal, position)
             error_prefix = "read report task failed:",
         }
     end
+    -- Always report the cookie state, even when the pipeline raised: a
+    -- rejection may have been recorded just before the uncaught error and
+    -- the parent is the only process allowed to persist it.
+    if type(outcome) ~= "table" then
+        outcome = { accepted = false, error = "report task returned no result",
+            error_kind = "job" }
+    end
+    outcome.cookie_expired = self:_cookie_expired()
     if auth_changed then
         outcome.auth = {
             cookies = self.settings:get("cookies", {}),
@@ -807,9 +994,12 @@ end
 -- Full report attempt: context, send, refresh-retry, renewal, final retry.
 -- Pure with respect to the parent state machine: everything the caller needs
 -- is described by the returned outcome table.
-function ReadReport:_run_pipeline(book_id, opts)
+function ReadReport:_run_pipeline_inner(book_id, opts)
     opts = opts or {}
-    local outcome = { accepted = false, renew_attempted = false }
+    local outcome = {
+        accepted = false,
+        renew_attempted = false,
+    }
 
     local context_ok, book = pcall(function()
         return self:ensure_context(book_id, false)
@@ -840,6 +1030,7 @@ function ReadReport:_run_pipeline(book_id, opts)
     end
 
     local failure = response_summary(self.client, result, http_code)
+    local auth_payload = is_auth_failure(self.client, result)
     local refresh_ok, refreshed = pcall(function()
         return self:ensure_context(book_id, true)
     end)
@@ -857,6 +1048,9 @@ function ReadReport:_run_pipeline(book_id, opts)
                 and retry_body.synckey ~= nil or false
             return outcome
         end
+        if retry_ok and is_auth_failure(self.client, retry_result) then
+            auth_payload = true
+        end
         failure = "initial=" .. failure .. "; refreshed="
             .. (retry_ok and response_summary(self.client, retry_result, retry_code)
                 or tostring(retry_result))
@@ -866,7 +1060,7 @@ function ReadReport:_run_pipeline(book_id, opts)
 
     if not opts.allow_renewal then
         outcome.error = failure
-        outcome.error_kind = "server"
+        outcome.error_kind = auth_payload and "authentication" or "server"
         outcome.error_prefix = "read report server rejected:"
         return outcome
     end
@@ -879,7 +1073,8 @@ function ReadReport:_run_pipeline(book_id, opts)
         outcome.error = failure .. "; renewal=" .. (renew_ok
             and response_summary(self.client, renew_result)
             or tostring(renew_result))
-        outcome.error_kind = "authentication"
+        -- The client persists the marker only for documented auth codes.
+        outcome.error_kind = self:_cookie_expired() and "authentication" or "renewal"
         outcome.error_prefix = "read report cookie renewal failed:"
         return outcome
     end
@@ -909,13 +1104,32 @@ function ReadReport:_run_pipeline(book_id, opts)
     outcome.error = failure .. "; final=" .. (final_ok
         and response_summary(self.client, final_result, final_code)
         or tostring(final_result))
-    outcome.error_kind = final_ok and "server" or "transport"
+    if final_ok then
+        outcome.error_kind = is_auth_failure(self.client, final_result)
+            and "authentication" or "server"
+    else
+        outcome.error_kind = "transport"
+    end
     outcome.error_prefix = "read report final retry failed:"
+    return outcome
+end
+
+-- The client marks cookie expiry in the process that performs the request
+-- (the forked child when a subprocess is used). Report the final state so the
+-- parent can persist it.
+function ReadReport:_run_pipeline(book_id, opts)
+    local outcome = self:_run_pipeline_inner(book_id, opts)
+    if type(outcome) == "table" then
+        outcome.cookie_expired = self:_cookie_expired()
+    end
     return outcome
 end
 
 -- Inline (blocking) report used when subprocess support is unavailable.
 function ReadReport:report_once()
+    if self:_cookie_expired() then
+        return false
+    end
     local proceed, book_id, position = self:_precheck()
     if not proceed then
         return false
@@ -1125,6 +1339,11 @@ function ReadReport:upload_position(book_id, position, elapsed_seconds)
     if self.job then
         return false, { error = "read_report_busy", error_kind = "busy" }
     end
+    -- ProgressSync calls this on document close / suspend as well as on
+    -- manual sync. A confirmed dead credential must produce zero requests.
+    if self:_cookie_expired() then
+        return false, cookie_gate_outcome()
+    end
     local outcome = self:_run_pipeline(tostring(book_id), {
         allow_renewal = self:_renewal_allowed(),
         position = position,
@@ -1132,6 +1351,10 @@ function ReadReport:upload_position(book_id, position, elapsed_seconds)
     })
     if outcome.renew_attempted then
         self.last_renew_attempt = self.now()
+    end
+    self:_apply_cookie_state(outcome)
+    if outcome.cookie_expired then
+        self:_stop_on_cookie_expired()
     end
     if type(outcome.book) == "table" then
         local ok, err = pcall(function()

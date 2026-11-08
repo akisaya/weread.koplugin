@@ -14,6 +14,47 @@ local DEFAULT_TIMEOUT_SECONDS = 15
 local Client = {}
 Client.__index = Client
 
+-- Media/Web endpoints report an expired login as -2012 (登录超时) or -2010
+-- (用户不存在) inside an HTTP 200 response. Keep this whitelist in one place:
+-- the report loop must not own a second copy of it.
+Client.AUTH_EXPIRED_CODES = { [-2012] = true, [-2010] = true }
+
+local AUTH_CODE_FIELDS = { "errCode", "errcode", "errorCode", "code" }
+
+-- Error codes arrive as numbers, numeric strings, floats, or nested inside
+-- data/result. Normalize once so every caller sees the same value.
+function Client.auth_error_code(result)
+    if type(result) ~= "table" then
+        return nil
+    end
+    local function scan(container)
+        if type(container) ~= "table" then return nil end
+        for _i, field in ipairs(AUTH_CODE_FIELDS) do
+            local code = tonumber(container[field])
+            if code and code ~= 0 then return code end
+        end
+        return nil
+    end
+    -- Scan every level: a top-level business code must not hide an auth code
+    -- nested under data/result. Prefer the auth-expired code when present.
+    local fallback
+    for _i, container in ipairs({ result, result.data or {}, result.result or {} }) do
+        local code = scan(container)
+        if code then
+            if Client.AUTH_EXPIRED_CODES[code] then
+                return code
+            end
+            fallback = fallback or code
+        end
+    end
+    return fallback
+end
+
+function Client.is_auth_expired_code(code)
+    local numeric = tonumber(code)
+    return numeric ~= nil and Client.AUTH_EXPIRED_CODES[numeric] == true
+end
+
 local function header_value(headers, name)
     if type(headers) ~= "table" or type(name) ~= "string" then return nil end
     if headers[name] ~= nil then return headers[name] end
@@ -182,6 +223,15 @@ function Client:new(settings)
     return setmetatable({
         settings = settings,
     }, self)
+end
+
+-- A renewal was definitively rejected; only new credentials can clear this.
+function Client:_mark_cookie_expired()
+    self.settings:mark_cookie_expired()
+end
+
+function Client:_mark_cookie_valid()
+    self.settings:mark_cookie_valid()
 end
 
 function Client:json_encode(data)
@@ -553,35 +603,51 @@ function Client:get_binary(url, opts)
 end
 
 function Client:renew_cookie()
-    local result, code, resp_headers = self:post_json("https://weread.qq.com/web/login/renewal", {
-        rq = "%2Fweb%2Fbook%2Fread",
-        ql = false,
-    }, {
-        -- Do not persist renewal cookies until the response explicitly confirms
-        -- success; failed renewals must leave the current credential set intact.
-        persist_response_cookies = false,
-    })
-    if not WeRead.is_success_response(result) then
-        error("Cookie renewal response did not include succ=1")
+    local ok, result, code, resp_headers = pcall(function()
+        return self:post_json("https://weread.qq.com/web/login/renewal", {
+            rq = "%2Fweb%2Fbook%2Fread",
+            ql = false,
+        }, {
+            -- Do not persist renewal cookies until the response explicitly
+            -- confirms success; failed renewals must leave the cookies intact.
+            persist_response_cookies = false,
+        })
+    end)
+
+    if ok and WeRead.is_success_response(result) then
+        local updates = {}
+        local set_cookie = header_value(resp_headers, "set-cookie")
+        if set_cookie then
+            updates.cookies = Cookie.merge_set_cookie(
+                self.settings:get("cookies", {}),
+                set_cookie
+            )
+        end
+        local wr_ticket = scalar_header_value(resp_headers, "x-wr-ticket")
+        if wr_ticket and wr_ticket ~= "" then
+            updates.wr_ticket = wr_ticket
+        end
+        local wr_wrpa = scalar_header_value(resp_headers, "x-wrpa-0")
+        if wr_wrpa and wr_wrpa ~= "" then
+            updates.wr_wrpa = wr_wrpa
+        end
+        self.settings:update_auth(updates, { replace_cookies = true })
+        self:_mark_cookie_valid()
+        return result, code, resp_headers
     end
-    local updates = {}
-    local set_cookie = header_value(resp_headers, "set-cookie")
-    if set_cookie then
-        updates.cookies = Cookie.merge_set_cookie(
-            self.settings:get("cookies", {}),
-            set_cookie
-        )
+
+    -- Only WeRead's documented auth codes prove the session cannot be renewed:
+    -- -2012 (登录超时) and -2010 (用户不存在). Network errors, 5xx and unknown
+    -- codes keep the normal retry cadence instead of disabling reporting.
+    local auth_code = ok and Client.auth_error_code(result) or nil
+    if Client.is_auth_expired_code(auth_code) then
+        self:_mark_cookie_expired()
     end
-    local wr_ticket = scalar_header_value(resp_headers, "x-wr-ticket")
-    if wr_ticket and wr_ticket ~= "" then
-        updates.wr_ticket = wr_ticket
+    if ok then
+        error("Cookie renewal rejected"
+            .. (auth_code ~= nil and ("; error_code=" .. tostring(auth_code)) or ""), 0)
     end
-    local wr_wrpa = scalar_header_value(resp_headers, "x-wrpa-0")
-    if wr_wrpa and wr_wrpa ~= "" then
-        updates.wr_wrpa = wr_wrpa
-    end
-    self.settings:update_auth(updates, { replace_cookies = true })
-    return result, code, resp_headers
+    error(tostring(result), 0)
 end
 
 function Client:gateway(api_name, params)

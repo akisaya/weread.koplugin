@@ -70,6 +70,11 @@ package.preload["weread.lib.protocol"] = function()
                 return string.format("%%%02X", ch:byte())
             end)
         end,
+        is_success_response = function(result)
+            if type(result) ~= "table" then return false end
+            local value = result.succ
+            return value == true or tonumber(value) == 1
+        end,
     }
 end
 
@@ -130,18 +135,118 @@ expect(reset_count == 1, "timeout was not reset after successful request")
 expect(merged_cookies[1] == "wr_ticket=new-ticket; Path=/",
     "response cookies were not persisted")
 
+local auth_events = {}
+settings.mark_cookie_expired = function()
+    auth_events[#auth_events + 1] = { kind = "expired" }
+end
+settings.mark_cookie_valid = function()
+    auth_events[#auth_events + 1] = { kind = "valid" }
+end
+settings.update_auth = function() end
+
+local renew_client = Client:new(settings)
+renew_client.post_json = function()
+    return { succ = 1 }, 200, {
+        ["set-cookie"] = "wr_skey=renewed; Path=/",
+        ["x-wr-ticket"] = "new-ticket",
+    }
+end
+renew_client:renew_cookie()
+expect(#auth_events == 1 and auth_events[1].kind == "valid",
+    "successful cookie renewal did not clear the expired state")
+
+-- Only documented auth codes are terminal. A definitive rejection is not
+-- retried, and HTTP status codes alone never mark the credential dead.
+local rejected_calls = 0
+renew_client.post_json = function()
+    rejected_calls = rejected_calls + 1
+    return { succ = 0, errCode = -2012 }, 200, {}
+end
+local renew_ok = pcall(function() renew_client:renew_cookie() end)
+expect(not renew_ok and rejected_calls == 1 and #auth_events == 2
+    and auth_events[2].kind == "expired",
+    "a -2012 rejection did not mark the cookie expired immediately")
+
+local http_calls = 0
+renew_client.post_json = function()
+    http_calls = http_calls + 1
+    error("HTTP 401, content_type=text/html")
+end
+local http_before = #auth_events
+local http_ok = pcall(function() renew_client:renew_cookie() end)
+expect(not http_ok and http_calls == 1 and #auth_events == http_before,
+    "an HTTP 401 must not mark the cookie expired or be retried")
+
+-- A transient renewal failure must not raise a permanent "expired" banner:
+-- only -2012/-2010 count as a definitive rejection.
+renew_client.post_json = function()
+    return { succ = 0, errCode = -1 }, 200, {}
+end
+local transient_before = #auth_events
+local transient_ok = pcall(function() renew_client:renew_cookie() end)
+expect(not transient_ok and #auth_events == transient_before,
+    "a transient renewal failure marked the cookie expired")
+
+-- Auth error codes are normalized in one place: numbers, numeric strings,
+-- floats, nested payloads and the generic "code" field.
+expect(Client.auth_error_code({ errCode = "-2012" }) == -2012,
+    "numeric string auth code was not normalized")
+expect(Client.auth_error_code({ data = { errcode = -2010 } }) == -2010,
+    "nested auth code was not normalized")
+expect(Client.auth_error_code({ code = 1, data = { errCode = -2012 } }) == -2012,
+    "a top-level business code hid a nested auth code")
+expect(Client.auth_error_code({ code = -2012.0 }) == -2012,
+    "float auth code was not normalized")
+expect(Client.auth_error_code({ succ = 0 }) == nil,
+    "a bare succ=0 must not yield an auth error code")
+expect(Client.is_auth_expired_code(-2012)
+    and Client.is_auth_expired_code("-2010")
+    and not Client.is_auth_expired_code(-2013),
+    "auth-expired whitelist was wrong")
+
+-- HTTP 403 and 5xx are not documented credential verdicts.
+renew_client.post_json = function()
+    error("HTTP 403, content_type=text/html")
+end
+local forbidden_before = #auth_events
+local forbidden_ok = pcall(function() renew_client:renew_cookie() end)
+expect(not forbidden_ok and #auth_events == forbidden_before,
+    "HTTP 403 on renewal marked the cookie expired")
+
+renew_client.post_json = function()
+    error("HTTP 500, content_type=application/json, error_message=upstream:123: HTTP 401")
+end
+local server_before = #auth_events
+local server_ok = pcall(function() renew_client:renew_cookie() end)
+expect(not server_ok and #auth_events == server_before,
+    "a server message containing HTTP 401 marked the cookie expired")
+
+-- A nested auth code in a renewal response is still definitive.
+local nested_renew = Client:new(settings)
+nested_renew.post_json = function()
+    return { succ = 0, data = { errCode = -2012 } }, 200, {}
+end
+local nested_before = #auth_events
+local nested_ok = pcall(function() nested_renew:renew_cookie() end)
+expect(not nested_ok and #auth_events == nested_before + 1
+    and auth_events[#auth_events].kind == "expired",
+    "nested auth code did not mark the cookie expired")
+
 responses[#responses + 1] = { body = "public", code = 200 }
+local public_request_index = #requests + 1
 client:request({ url = "https://example.com/public" })
-expect(requests[2].headers.Cookie == nil,
+expect(requests[public_request_index].headers.Cookie == nil,
     "WeRead cookie leaked to a non-WeRead host")
 
+local resets_before_transport_failure = reset_count
 responses[#responses + 1] = { raise = "transport failed" }
 local ok, err = pcall(function()
     client:request({ url = "https://weread.qq.com/web/fail" })
 end)
 expect(not ok and tostring(err):find("transport failed", 1, true),
     "transport error was not propagated")
-expect(reset_count == 3, "timeout was not reset after transport error")
+expect(reset_count == resets_before_transport_failure + 1,
+    "timeout was not reset after transport error")
 
 responses[#responses + 1] = {
     body = "",
